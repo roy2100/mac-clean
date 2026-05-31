@@ -1,0 +1,198 @@
+#!/usr/bin/env bun
+
+/**
+ * scan-remnants.js — 扫描 macOS app 卸载残留文件
+ *
+ * 用法：
+ *   bun index.js                        # 扫描所有已知残留目录
+ *   bun index.js spotify                # 只看包含 "spotify" 的条目
+ *   bun index.js --size                 # 附带显示磁盘占用
+ *   bun index.js --paths                # 只输出路径，适合管道删除
+ *   bun index.js --large                # 只展示 100MB 以上的条目（自动显示大小）
+ *
+ * 删除示例：
+ *   bun index.js --paths spotify        # 预览路径
+ *   bun index.js --paths spotify | xargs rm -rf
+ */
+
+import fs from "fs";
+import path from "path";
+import os from "os";
+import { execFile } from "child_process";
+import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
+
+// ──────────────────────────────────────────────
+// 配置
+// ──────────────────────────────────────────────
+const HOME = os.homedir();
+
+const SCAN_DIRS = [
+  { dir: `${HOME}/Library/Application Support`, label: "App Support (用户)" },
+  { dir: `${HOME}/Library/Preferences`,         label: "Preferences (plist)" },
+  { dir: `${HOME}/Library/Caches`,              label: "Caches (用户)" },
+  { dir: `${HOME}/Library/Logs`,                label: "Logs (用户)" },
+  { dir: `${HOME}/Library/Containers`,          label: "Containers (沙盒)" },
+  { dir: `${HOME}/Library/Group Containers`,    label: "Group Containers" },
+  { dir: `${HOME}/Library/LaunchAgents`,        label: "LaunchAgents (用户)" },
+  { dir: `/Library/Application Support`,        label: "App Support (系统)" },
+  { dir: `/Library/LaunchAgents`,               label: "LaunchAgents (系统)" },
+  { dir: `/Library/LaunchDaemons`,              label: "LaunchDaemons (系统)" },
+  { dir: `/Library/PrivilegedHelperTools`,      label: "PrivilegedHelperTools" },
+];
+
+const SKIP_PATTERNS = [
+  /^com\.apple\./i,
+  /^Apple$/i,
+  /^MobileSync$/i,
+  /^Spotlight$/i,
+  /^Safari$/i,
+  /^iCloud$/i,
+  /^CloudDocs$/i,
+  /^CallHistoryDB$/i,
+  /^AddressBook$/i,
+  /^com\.crashlytics\./i,
+];
+
+// ──────────────────────────────────────────────
+// CLI 参数解析
+// ──────────────────────────────────────────────
+const args = process.argv.slice(2);
+const showSize  = args.includes("--size");
+const pathsOnly = args.includes("--paths");
+const largeOnly = args.includes("--large");
+const filterRaw = args.find(a => !a.startsWith("--"));
+const filter    = filterRaw ? filterRaw.toLowerCase() : null;
+
+const LARGE_THRESHOLD_KB = 100 * 1024;
+
+// ──────────────────────────────────────────────
+// 工具函数
+// ──────────────────────────────────────────────
+
+async function getSizeKB(fullPath) {
+  try {
+    const { stdout } = await execFileAsync("du", ["-sk", fullPath]);
+    return parseInt(stdout.split("\t")[0].trim(), 10);
+  } catch {
+    return -1;
+  }
+}
+
+function formatKB(kb) {
+  if (kb < 0)            return "?";
+  if (kb < 1024)         return `${kb} K`;
+  if (kb < 1024 * 1024)  return `${(kb / 1024).toFixed(1)} M`;
+  return `${(kb / (1024 * 1024)).toFixed(1)} G`;
+}
+
+function shouldSkip(name) {
+  return SKIP_PATTERNS.some(re => re.test(name));
+}
+
+const c = {
+  reset:  "\x1b[0m",
+  bold:   "\x1b[1m",
+  dim:    "\x1b[2m",
+  cyan:   "\x1b[36m",
+  yellow: "\x1b[33m",
+  green:  "\x1b[32m",
+  gray:   "\x1b[90m",
+};
+
+// ──────────────────────────────────────────────
+// 主逻辑
+// ──────────────────────────────────────────────
+
+if (!pathsOnly) {
+  console.log(`\n${c.bold}🔍 macOS 卸载残留扫描器${c.reset}`);
+  if (filter)   console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
+  if (showSize) console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
+  if (largeOnly) console.log(`${c.yellow}只显示 100MB 以上的条目（较慢）${c.reset}`);
+  console.log();
+}
+
+// 第一遍：收集所有候选条目
+const sections = [];
+for (const { dir, label } of SCAN_DIRS) {
+  if (!fs.existsSync(dir)) continue;
+
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    if (!pathsOnly) console.log(`${c.gray}[跳过] ${dir}  (无读取权限)${c.reset}`);
+    continue;
+  }
+
+  const items = entries
+    .filter(name => {
+      if (shouldSkip(name)) return false;
+      if (filter && !name.toLowerCase().includes(filter)) return false;
+      return true;
+    })
+    .map(name => {
+      const fullPath = path.join(dir, name);
+      try {
+        return { name, fullPath, stat: fs.statSync(fullPath), kb: -1 };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+  if (items.length > 0) sections.push({ dir, label, items });
+}
+
+// 第二遍：并发获取所有条目大小（仅 --size / --large 时）
+const needSize = showSize || largeOnly;
+if (needSize) {
+  const allItems = sections.flatMap(s => s.items);
+  const sizes = await Promise.all(allItems.map(item => getSizeKB(item.fullPath)));
+  allItems.forEach((item, i) => { item.kb = sizes[i]; });
+}
+
+// 第三遍：过滤 + 排序 + 打印
+let totalCount = 0;
+
+for (const { dir, label, items } of sections) {
+  let displayItems = largeOnly
+    ? items.filter(item => item.kb >= LARGE_THRESHOLD_KB)
+    : items;
+
+  if (displayItems.length === 0) continue;
+
+  if (needSize) displayItems = [...displayItems].sort((a, b) => b.kb - a.kb);
+
+  if (!pathsOnly) {
+    console.log(`${c.cyan}${c.bold}▸ ${label}${c.reset}`);
+    console.log(`${c.gray}  ${dir}${c.reset}`);
+  }
+
+  for (const { name, fullPath, stat, kb } of displayItems) {
+    if (pathsOnly) {
+      console.log(fullPath);
+    } else {
+      const icon    = stat.isDirectory() ? "📁" : "📄";
+      const sizeStr = needSize ? `  ${c.green}${formatKB(kb)}${c.reset}` : "";
+      console.log(`  ${icon} ${name}${sizeStr}`);
+    }
+    totalCount++;
+  }
+
+  if (!pathsOnly) console.log();
+}
+
+// ──────────────────────────────────────────────
+// 汇总
+// ──────────────────────────────────────────────
+if (!pathsOnly) {
+  if (totalCount === 0) {
+    const msg = filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留";
+    console.log(`${c.green}✅ ${msg}${c.reset}\n`);
+  } else {
+    console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个条目${c.reset}`);
+    console.log(`${c.dim}⚠️  删除前请确认，部分文件可能仍被其他 app 使用${c.reset}\n`);
+  }
+}
