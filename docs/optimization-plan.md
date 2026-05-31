@@ -31,7 +31,7 @@ first so the most impactful items surface immediately.
 
 ---
 
-## 4. Cross-reference against installed apps (accuracy)
+## ✅ 4. Cross-reference against installed apps (accuracy)
 
 **Priority:** Medium — core value  
 The script currently surfaces all non-Apple entries regardless of whether the corresponding

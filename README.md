@@ -10,6 +10,7 @@ bun index.js spotify                # 只看包含 "spotify" 的条目
 bun index.js --size                 # 附带显示磁盘占用
 bun index.js --large                # 只展示 100MB 以上的条目
 bun index.js --paths                # 只输出路径，适合管道删除
+bun index.js --orphans              # 只展示对应 app 已卸载的条目
 ```
 
 ## 删除示例

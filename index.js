@@ -9,6 +9,7 @@
  *   bun index.js --size                 # 附带显示磁盘占用
  *   bun index.js --paths                # 只输出路径，适合管道删除
  *   bun index.js --large                # 只展示 100MB 以上的条目（自动显示大小）
+ *   bun index.js --orphans              # 只展示对应 app 已卸载的条目
  *
  * 删除示例：
  *   bun index.js --paths spotify        # 预览路径
@@ -59,11 +60,12 @@ const SKIP_PATTERNS = [
 // CLI 参数解析
 // ──────────────────────────────────────────────
 const args = process.argv.slice(2);
-const showSize  = args.includes("--size");
-const pathsOnly = args.includes("--paths");
-const largeOnly = args.includes("--large");
-const filterRaw = args.find(a => !a.startsWith("--"));
-const filter    = filterRaw ? filterRaw.toLowerCase() : null;
+const showSize   = args.includes("--size");
+const pathsOnly  = args.includes("--paths");
+const largeOnly  = args.includes("--large");
+const orphansOnly = args.includes("--orphans");
+const filterRaw  = args.find(a => !a.startsWith("--"));
+const filter     = filterRaw ? filterRaw.toLowerCase() : null;
 
 const LARGE_THRESHOLD_KB = 100 * 1024;
 
@@ -91,6 +93,47 @@ function shouldSkip(name) {
   return SKIP_PATTERNS.some(re => re.test(name));
 }
 
+async function getInstalledApps() {
+  const appDirs = ["/Applications", `${HOME}/Applications`];
+  const bundleIds = new Set();
+  const appNames = new Set();
+
+  const tasks = [];
+  for (const appDir of appDirs) {
+    if (!fs.existsSync(appDir)) continue;
+    let apps;
+    try { apps = fs.readdirSync(appDir); } catch { continue; }
+    for (const app of apps) {
+      if (!app.endsWith(".app")) continue;
+      appNames.add(app.replace(/\.app$/, "").toLowerCase());
+      const plistPath = path.join(appDir, app, "Contents", "Info.plist");
+      if (!fs.existsSync(plistPath)) continue;
+      tasks.push(
+        execFileAsync("plutil", ["-convert", "json", "-o", "-", plistPath])
+          .then(({ stdout }) => {
+            const info = JSON.parse(stdout);
+            if (info.CFBundleIdentifier)  bundleIds.add(info.CFBundleIdentifier.toLowerCase());
+            if (info.CFBundleDisplayName) appNames.add(info.CFBundleDisplayName.toLowerCase());
+            if (info.CFBundleName)        appNames.add(info.CFBundleName.toLowerCase());
+          })
+          .catch(() => {})
+      );
+    }
+  }
+  await Promise.all(tasks);
+  return { bundleIds, appNames };
+}
+
+function isActiveApp(name, { bundleIds, appNames }) {
+  const lower = name.toLowerCase();
+  if (appNames.has(lower)) return true;
+  if (bundleIds.has(lower)) return true;
+  for (const id of bundleIds) {
+    if (lower.startsWith(id) || id.startsWith(lower + ".")) return true;
+  }
+  return false;
+}
+
 const c = {
   reset:  "\x1b[0m",
   bold:   "\x1b[1m",
@@ -109,7 +152,8 @@ if (!pathsOnly) {
   console.log(`\n${c.bold}🔍 macOS 卸载残留扫描器${c.reset}`);
   if (filter)   console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
   if (showSize) console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
-  if (largeOnly) console.log(`${c.yellow}只显示 100MB 以上的条目（较慢）${c.reset}`);
+  if (largeOnly)   console.log(`${c.yellow}只显示 100MB 以上的条目（较慢）${c.reset}`);
+  if (orphansOnly) console.log(`${c.yellow}只显示对应 app 已卸载的条目${c.reset}`);
   console.log();
 }
 
@@ -145,7 +189,16 @@ for (const { dir, label } of SCAN_DIRS) {
   if (items.length > 0) sections.push({ dir, label, items });
 }
 
-// 第二遍：并发获取所有条目大小（仅 --size / --large 时）
+// 第二遍：过滤掉仍在安装的 app（仅 --orphans 时）
+if (orphansOnly) {
+  const installed = await getInstalledApps();
+  for (const section of sections) {
+    section.items = section.items.filter(item => !isActiveApp(item.name, installed));
+  }
+  sections.splice(0, sections.length, ...sections.filter(s => s.items.length > 0));
+}
+
+// 第三遍：并发获取所有条目大小（仅 --size / --large 时）
 const needSize = showSize || largeOnly;
 if (needSize) {
   const allItems = sections.flatMap(s => s.items);
@@ -153,7 +206,7 @@ if (needSize) {
   allItems.forEach((item, i) => { item.kb = sizes[i]; });
 }
 
-// 第三遍：过滤 + 排序 + 打印
+// 第四遍：过滤 + 排序 + 打印
 let totalCount = 0;
 
 for (const { dir, label, items } of sections) {
