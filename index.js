@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 /**
- * scan-remnants.js — 扫描 macOS app 卸载残留文件
+ * scan-remnants.js — 扫描 macOS app 卸载残留文件 / npm node_modules
  *
  * 用法：
  *   bun index.js                        # 扫描所有已知残留目录
@@ -10,10 +10,15 @@
  *   bun index.js --paths                # 只输出路径，适合管道删除
  *   bun index.js --large                # 只展示 100MB 以上的条目（自动显示大小）
  *   bun index.js --orphans              # 只展示对应 app 已卸载的条目
+ *   bun index.js --npm                  # 扫描 HOME 下所有 node_modules 目录
+ *   bun index.js --npm --size           # 同上，附带磁盘占用
+ *   bun index.js --npm --large          # 只展示 100MB 以上的 node_modules
+ *   bun index.js --npm myproject        # 只展示路径包含 "myproject" 的 node_modules
  *
  * 删除示例：
  *   bun index.js --paths spotify        # 预览路径
  *   bun index.js --paths spotify | xargs rm -rf
+ *   bun index.js --npm --paths | xargs rm -rf   # 删除所有 node_modules
  */
 
 import fs from "fs";
@@ -60,12 +65,13 @@ const SKIP_PATTERNS = [
 // CLI 参数解析
 // ──────────────────────────────────────────────
 const args = process.argv.slice(2);
-const showSize   = args.includes("--size");
-const pathsOnly  = args.includes("--paths");
-const largeOnly  = args.includes("--large");
+const showSize    = args.includes("--size");
+const pathsOnly   = args.includes("--paths");
+const largeOnly   = args.includes("--large");
 const orphansOnly = args.includes("--orphans");
-const filterRaw  = args.find(a => !a.startsWith("--"));
-const filter     = filterRaw ? filterRaw.toLowerCase() : null;
+const scanNpm     = args.includes("--npm");
+const filterRaw   = args.find(a => !a.startsWith("--"));
+const filter      = filterRaw ? filterRaw.toLowerCase() : null;
 
 const LARGE_THRESHOLD_KB = 100 * 1024;
 
@@ -134,6 +140,44 @@ function isActiveApp(name, { bundleIds, appNames }) {
   return false;
 }
 
+// 在 searchRoot 下递归查找所有 node_modules 目录（不递归进 node_modules 内部）
+async function findNodeModules(searchRoot, maxDepth = 8) {
+  const results = [];
+  const SKIP_DIRS = new Set(["Library", ".Trash", ".cache", ".npm", ".nvm"]);
+
+  async function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const subdirs = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith(".") && entry.name !== ".") continue;
+      if (SKIP_DIRS.has(entry.name)) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.name === "node_modules") {
+        const projectName = path.basename(dir);
+        if (!filter || dir.toLowerCase().includes(filter) || projectName.toLowerCase().includes(filter)) {
+          try {
+            results.push({ name: `${projectName}/node_modules`, fullPath, stat: fs.statSync(fullPath), kb: -1 });
+          } catch {}
+        }
+        // 不递归进 node_modules 内部
+        continue;
+      }
+      subdirs.push(fullPath);
+    }
+    await Promise.all(subdirs.map(d => walk(d, depth + 1)));
+  }
+
+  await walk(searchRoot, 0);
+  return results;
+}
+
 const c = {
   reset:  "\x1b[0m",
   bold:   "\x1b[1m",
@@ -149,92 +193,131 @@ const c = {
 // ──────────────────────────────────────────────
 
 if (!pathsOnly) {
-  console.log(`\n${c.bold}🔍 macOS 卸载残留扫描器${c.reset}`);
-  if (filter)   console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
-  if (showSize) console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
+  const title = scanNpm ? "📦 npm node_modules 扫描器" : "🔍 macOS 卸载残留扫描器";
+  console.log(`\n${c.bold}${title}${c.reset}`);
+  if (filter)      console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
+  if (showSize)    console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
   if (largeOnly)   console.log(`${c.yellow}只显示 100MB 以上的条目（较慢）${c.reset}`);
   if (orphansOnly) console.log(`${c.yellow}只显示对应 app 已卸载的条目${c.reset}`);
+  if (scanNpm)     console.log(`${c.yellow}搜索根目录：${HOME}${c.reset}`);
   console.log();
 }
 
-// 第一遍：收集所有候选条目
-const sections = [];
-for (const { dir, label } of SCAN_DIRS) {
-  if (!fs.existsSync(dir)) continue;
-
-  let entries;
-  try {
-    entries = fs.readdirSync(dir);
-  } catch {
-    if (!pathsOnly) console.log(`${c.gray}[跳过] ${dir}  (无读取权限)${c.reset}`);
-    continue;
-  }
-
-  const items = entries
-    .filter(name => {
-      if (shouldSkip(name)) return false;
-      if (filter && !name.toLowerCase().includes(filter)) return false;
-      return true;
-    })
-    .map(name => {
-      const fullPath = path.join(dir, name);
-      try {
-        return { name, fullPath, stat: fs.statSync(fullPath), kb: -1 };
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-
-  if (items.length > 0) sections.push({ dir, label, items });
-}
-
-// 第二遍：过滤掉仍在安装的 app（仅 --orphans 时）
-if (orphansOnly) {
-  const installed = await getInstalledApps();
-  for (const section of sections) {
-    section.items = section.items.filter(item => !isActiveApp(item.name, installed));
-  }
-  sections.splice(0, sections.length, ...sections.filter(s => s.items.length > 0));
-}
-
-// 第三遍：并发获取所有条目大小（仅 --size / --large 时）
 const needSize = showSize || largeOnly;
-if (needSize) {
-  const allItems = sections.flatMap(s => s.items);
-  const sizes = await Promise.all(allItems.map(item => getSizeKB(item.fullPath)));
-  allItems.forEach((item, i) => { item.kb = sizes[i]; });
-}
-
-// 第四遍：过滤 + 排序 + 打印
 let totalCount = 0;
 
-for (const { dir, label, items } of sections) {
-  let displayItems = largeOnly
-    ? items.filter(item => item.kb >= LARGE_THRESHOLD_KB)
-    : items;
+if (scanNpm) {
+  // ── npm node_modules 扫描模式 ─────────────────
+  const npmItems = await findNodeModules(HOME);
 
-  if (displayItems.length === 0) continue;
+  if (needSize) {
+    const sizes = await Promise.all(npmItems.map(item => getSizeKB(item.fullPath)));
+    npmItems.forEach((item, i) => { item.kb = sizes[i]; });
+  }
+
+  let displayItems = largeOnly
+    ? npmItems.filter(item => item.kb >= LARGE_THRESHOLD_KB)
+    : npmItems;
 
   if (needSize) displayItems = [...displayItems].sort((a, b) => b.kb - a.kb);
 
-  if (!pathsOnly) {
-    console.log(`${c.cyan}${c.bold}▸ ${label}${c.reset}`);
-    console.log(`${c.gray}  ${dir}${c.reset}`);
+  if (!pathsOnly && displayItems.length > 0) {
+    console.log(`${c.cyan}${c.bold}▸ node_modules 目录${c.reset}`);
+    console.log(`${c.gray}  ${HOME}${c.reset}`);
   }
 
-  for (const { name, fullPath, stat, kb } of displayItems) {
+  for (const { name, fullPath, kb } of displayItems) {
     if (pathsOnly) {
       console.log(fullPath);
     } else {
-      const icon    = stat.isDirectory() ? "📁" : "📄";
       const sizeStr = needSize ? `  ${c.green}${formatKB(kb)}${c.reset}` : "";
-      console.log(`  ${icon} ${name}${sizeStr}`);
+      console.log(`  📦 ${name}${sizeStr}`);
+      console.log(`     ${c.gray}${fullPath}${c.reset}`);
     }
     totalCount++;
   }
 
-  if (!pathsOnly) console.log();
+  if (!pathsOnly && displayItems.length > 0) console.log();
+
+} else {
+  // ── macOS 残留扫描模式 ────────────────────────
+
+  // 第一遍：收集所有候选条目
+  const sections = [];
+  for (const { dir, label } of SCAN_DIRS) {
+    if (!fs.existsSync(dir)) continue;
+
+    let entries;
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      if (!pathsOnly) console.log(`${c.gray}[跳过] ${dir}  (无读取权限)${c.reset}`);
+      continue;
+    }
+
+    const items = entries
+      .filter(name => {
+        if (shouldSkip(name)) return false;
+        if (filter && !name.toLowerCase().includes(filter)) return false;
+        return true;
+      })
+      .map(name => {
+        const fullPath = path.join(dir, name);
+        try {
+          return { name, fullPath, stat: fs.statSync(fullPath), kb: -1 };
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    if (items.length > 0) sections.push({ dir, label, items });
+  }
+
+  // 第二遍：过滤掉仍在安装的 app（仅 --orphans 时）
+  if (orphansOnly) {
+    const installed = await getInstalledApps();
+    for (const section of sections) {
+      section.items = section.items.filter(item => !isActiveApp(item.name, installed));
+    }
+    sections.splice(0, sections.length, ...sections.filter(s => s.items.length > 0));
+  }
+
+  // 第三遍：并发获取所有条目大小（仅 --size / --large 时）
+  if (needSize) {
+    const allItems = sections.flatMap(s => s.items);
+    const sizes = await Promise.all(allItems.map(item => getSizeKB(item.fullPath)));
+    allItems.forEach((item, i) => { item.kb = sizes[i]; });
+  }
+
+  // 第四遍：过滤 + 排序 + 打印
+  for (const { dir, label, items } of sections) {
+    let displayItems = largeOnly
+      ? items.filter(item => item.kb >= LARGE_THRESHOLD_KB)
+      : items;
+
+    if (displayItems.length === 0) continue;
+
+    if (needSize) displayItems = [...displayItems].sort((a, b) => b.kb - a.kb);
+
+    if (!pathsOnly) {
+      console.log(`${c.cyan}${c.bold}▸ ${label}${c.reset}`);
+      console.log(`${c.gray}  ${dir}${c.reset}`);
+    }
+
+    for (const { name, fullPath, stat, kb } of displayItems) {
+      if (pathsOnly) {
+        console.log(fullPath);
+      } else {
+        const icon    = stat.isDirectory() ? "📁" : "📄";
+        const sizeStr = needSize ? `  ${c.green}${formatKB(kb)}${c.reset}` : "";
+        console.log(`  ${icon} ${name}${sizeStr}`);
+      }
+      totalCount++;
+    }
+
+    if (!pathsOnly) console.log();
+  }
 }
 
 // ──────────────────────────────────────────────
@@ -242,8 +325,13 @@ for (const { dir, label, items } of sections) {
 // ──────────────────────────────────────────────
 if (!pathsOnly) {
   if (totalCount === 0) {
-    const msg = filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留";
+    const msg = scanNpm
+      ? (filter ? `未找到包含 "${filter}" 的 node_modules 目录` : "未找到 node_modules 目录")
+      : (filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留");
     console.log(`${c.green}✅ ${msg}${c.reset}\n`);
+  } else if (scanNpm) {
+    console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个 node_modules 目录${c.reset}`);
+    console.log(`${c.dim}💡 删除示例：bun index.js --npm --paths | xargs rm -rf${c.reset}\n`);
   } else {
     console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个条目${c.reset}`);
     console.log(`${c.dim}⚠️  删除前请确认，部分文件可能仍被其他 app 使用${c.reset}\n`);
