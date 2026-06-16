@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 /**
- * scan-remnants.js — 扫描 macOS app 卸载残留文件 / npm node_modules
+ * scan-remnants.js — 扫描 macOS app 卸载残留文件 / npm node_modules / Downloads 大文件
  *
  * 用法：
  *   bun index.js                        # 扫描所有已知残留目录
@@ -14,11 +14,15 @@
  *   bun index.js --npm --size           # 同上，附带磁盘占用
  *   bun index.js --npm --large          # 只展示 100MB 以上的 node_modules
  *   bun index.js --npm myproject        # 只展示路径包含 "myproject" 的 node_modules
+ *   bun index.js --downloads            # 扫描 Downloads 下的大文件（默认 ≥50MB）
+ *   bun index.js --downloads --large    # 只展示 100MB 以上的文件
+ *   bun index.js --downloads dmg        # 只展示路径包含 "dmg" 的大文件
  *
  * 删除示例：
  *   bun index.js --paths spotify        # 预览路径
  *   bun index.js --paths spotify | xargs rm -rf
  *   bun index.js --npm --paths | xargs rm -rf   # 删除所有 node_modules
+ *   bun index.js --downloads --paths | xargs rm -rf   # 删除所有大文件
  */
 
 import fs from "fs";
@@ -70,10 +74,13 @@ const pathsOnly   = args.includes("--paths");
 const largeOnly   = args.includes("--large");
 const orphansOnly = args.includes("--orphans");
 const scanNpm     = args.includes("--npm");
+const scanDownloads = args.includes("--downloads");
 const filterRaw   = args.find(a => !a.startsWith("--"));
 const filter      = filterRaw ? filterRaw.toLowerCase() : null;
 
 const LARGE_THRESHOLD_KB = 100 * 1024;
+// Downloads 模式默认门槛：≥50MB 才算"大文件"
+const DOWNLOADS_THRESHOLD_KB = 50 * 1024;
 
 // ──────────────────────────────────────────────
 // 工具函数
@@ -178,6 +185,39 @@ async function findNodeModules(searchRoot, maxDepth = 8) {
   return results;
 }
 
+// 在 searchRoot 下递归查找所有文件，按大小返回（大小直接取自 stat，无需 du）
+async function findLargeFiles(searchRoot, maxDepth = 8) {
+  const results = [];
+  const SKIP_DIRS = new Set([".Trash"]);
+
+  function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name.startsWith(".")) continue;
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        walk(fullPath, depth + 1);
+      } else if (entry.isFile()) {
+        if (filter && !fullPath.toLowerCase().includes(filter)) continue;
+        try {
+          const stat = fs.statSync(fullPath);
+          results.push({ name: path.relative(searchRoot, fullPath), fullPath, stat, kb: Math.round(stat.size / 1024) });
+        } catch {}
+      }
+    }
+  }
+
+  walk(searchRoot, 0);
+  return results;
+}
+
 const c = {
   reset:  "\x1b[0m",
   bold:   "\x1b[1m",
@@ -192,21 +232,58 @@ const c = {
 // 主逻辑
 // ──────────────────────────────────────────────
 
+const DOWNLOADS_DIR = `${HOME}/Downloads`;
+
 if (!pathsOnly) {
-  const title = scanNpm ? "📦 npm node_modules 扫描器" : "🔍 macOS 卸载残留扫描器";
+  const title = scanDownloads
+    ? "📥 Downloads 大文件扫描器"
+    : scanNpm
+      ? "📦 npm node_modules 扫描器"
+      : "🔍 macOS 卸载残留扫描器";
   console.log(`\n${c.bold}${title}${c.reset}`);
-  if (filter)      console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
-  if (showSize)    console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
-  if (largeOnly)   console.log(`${c.yellow}只显示 100MB 以上的条目（较慢）${c.reset}`);
-  if (orphansOnly) console.log(`${c.yellow}只显示对应 app 已卸载的条目${c.reset}`);
-  if (scanNpm)     console.log(`${c.yellow}搜索根目录：${HOME}${c.reset}`);
+  if (filter)        console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
+  if (showSize)      console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
+  if (largeOnly)     console.log(`${c.yellow}只显示 100MB 以上的条目${c.reset}`);
+  if (orphansOnly)   console.log(`${c.yellow}只显示对应 app 已卸载的条目${c.reset}`);
+  if (scanNpm)       console.log(`${c.yellow}搜索根目录：${HOME}${c.reset}`);
+  if (scanDownloads) {
+    const thresholdKb = largeOnly ? LARGE_THRESHOLD_KB : DOWNLOADS_THRESHOLD_KB;
+    console.log(`${c.yellow}搜索目录：${DOWNLOADS_DIR}${c.reset}`);
+    console.log(`${c.yellow}门槛：≥${formatKB(thresholdKb)}${c.reset}`);
+  }
   console.log();
 }
 
 const needSize = showSize || largeOnly;
 let totalCount = 0;
 
-if (scanNpm) {
+if (scanDownloads) {
+  // ── Downloads 大文件扫描模式 ───────────────────
+  const thresholdKb = largeOnly ? LARGE_THRESHOLD_KB : DOWNLOADS_THRESHOLD_KB;
+  const allFiles = await findLargeFiles(DOWNLOADS_DIR);
+
+  const displayItems = allFiles
+    .filter(item => item.kb >= thresholdKb)
+    .sort((a, b) => b.kb - a.kb);
+
+  if (!pathsOnly && displayItems.length > 0) {
+    console.log(`${c.cyan}${c.bold}▸ Downloads 大文件${c.reset}`);
+    console.log(`${c.gray}  ${DOWNLOADS_DIR}${c.reset}`);
+  }
+
+  for (const { name, fullPath, kb } of displayItems) {
+    if (pathsOnly) {
+      console.log(fullPath);
+    } else {
+      console.log(`  📄 ${name}  ${c.green}${formatKB(kb)}${c.reset}`);
+      console.log(`     ${c.gray}${fullPath}${c.reset}`);
+    }
+    totalCount++;
+  }
+
+  if (!pathsOnly && displayItems.length > 0) console.log();
+
+} else if (scanNpm) {
   // ── npm node_modules 扫描模式 ─────────────────
   const npmItems = await findNodeModules(HOME);
 
@@ -325,10 +402,15 @@ if (scanNpm) {
 // ──────────────────────────────────────────────
 if (!pathsOnly) {
   if (totalCount === 0) {
-    const msg = scanNpm
-      ? (filter ? `未找到包含 "${filter}" 的 node_modules 目录` : "未找到 node_modules 目录")
-      : (filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留");
+    const msg = scanDownloads
+      ? (filter ? `未找到包含 "${filter}" 的大文件` : "未找到大文件")
+      : scanNpm
+        ? (filter ? `未找到包含 "${filter}" 的 node_modules 目录` : "未找到 node_modules 目录")
+        : (filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留");
     console.log(`${c.green}✅ ${msg}${c.reset}\n`);
+  } else if (scanDownloads) {
+    console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个大文件${c.reset}`);
+    console.log(`${c.dim}💡 删除示例：bun index.js --downloads --paths | xargs rm -rf${c.reset}\n`);
   } else if (scanNpm) {
     console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个 node_modules 目录${c.reset}`);
     console.log(`${c.dim}💡 删除示例：bun index.js --npm --paths | xargs rm -rf${c.reset}\n`);
