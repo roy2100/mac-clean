@@ -1,6 +1,6 @@
 # mac-clean
 
-扫描 macOS 上常见的 app 卸载残留文件。
+扫描 macOS 上常见的 app 卸载残留文件，也可扫描 `node_modules` 目录和 Downloads 大文件。
 
 ## 用法
 
@@ -13,6 +13,21 @@ bun index.js --paths                # 只输出路径，适合管道删除
 bun index.js --orphans              # 只展示对应 app 已卸载的条目
 ```
 
+## 其他扫描模式
+
+```bash
+# 扫描 HOME 下所有 node_modules 目录
+bun index.js --npm
+bun index.js --npm --size           # 附带磁盘占用
+bun index.js --npm --large          # 只展示 100MB 以上的 node_modules
+bun index.js --npm myproject        # 只展示路径包含 "myproject" 的目录
+
+# 扫描 Downloads 目录下的大文件（默认 ≥50MB）
+bun index.js --downloads
+bun index.js --downloads --large    # 只展示 100MB 以上的文件
+bun index.js --downloads dmg        # 只展示路径包含 "dmg" 的文件
+```
+
 ## 删除示例
 
 ```bash
@@ -21,6 +36,10 @@ bun index.js --paths spotify
 
 # 确认无误后删除
 bun index.js --paths spotify | xargs rm -rf
+
+# 删除所有 node_modules / Downloads 大文件
+bun index.js --npm --paths | xargs rm -rf
+bun index.js --downloads --paths | xargs rm -rf
 ```
 
 ## 扫描范围
