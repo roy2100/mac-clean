@@ -17,12 +17,16 @@
  *   bun index.js --downloads            # 扫描 Downloads 下的大文件（默认 ≥50MB）
  *   bun index.js --downloads --large    # 只展示 100MB 以上的文件
  *   bun index.js --downloads dmg        # 只展示路径包含 "dmg" 的大文件
+ *   bun index.js --procs                # 扫描残余的 Node 开发进程（npm run dev / vite / webpack …）
+ *   bun index.js --procs --large        # 只展示 RSS ≥100MB 的进程
+ *   bun index.js --procs finance        # 只展示命令行包含 "finance" 的进程
  *
  * 删除示例：
  *   bun index.js --paths spotify        # 预览路径
  *   bun index.js --paths spotify | xargs rm -rf
  *   bun index.js --npm --paths | xargs rm -rf   # 删除所有 node_modules
  *   bun index.js --downloads --paths | xargs rm -rf   # 删除所有大文件
+ *   bun index.js --procs --paths | xargs kill   # 结束所有残余 Node 开发进程
  */
 
 import fs from "fs";
@@ -75,6 +79,7 @@ const largeOnly   = args.includes("--large");
 const orphansOnly = args.includes("--orphans");
 const scanNpm     = args.includes("--npm");
 const scanDownloads = args.includes("--downloads");
+const scanProcs   = args.includes("--procs");
 const filterRaw   = args.find(a => !a.startsWith("--"));
 const filter      = filterRaw ? filterRaw.toLowerCase() : null;
 
@@ -218,6 +223,86 @@ async function findLargeFiles(searchRoot, maxDepth = 8) {
   return results;
 }
 
+// ── Node 开发进程识别 ──────────────────────────
+// 判断命令是否由 node/bun/deno 或包管理器驱动
+const NODE_EXEC_RE = /(^|\/)(node|bun|deno)(\s|$)|(^|\/)(npm|npx|yarn|pnpm)(\s|$)/i;
+function isNodeProc(cmd) {
+  return NODE_EXEC_RE.test(cmd) || /node_modules\/\.bin\//.test(cmd);
+}
+
+// 命中即认为是"开发进程"（dev server / watcher / bundler …）
+const DEV_PATTERNS = [
+  /\b(run|exec)\s+(dev|start|serve|watch|develop|storybook)\b/i,
+  /\bvite\b/i,
+  /webpack(-dev-server)?\b/i,
+  /\bnext\b\s+(dev|start)\b|next-server\b/i,
+  /\bnuxt\b/i,
+  /\bnodemon\b/i,
+  /\bts-node\b/i,
+  /\btsx\b\s+watch\b/i,
+  /\bparcel\b/i,
+  /\bastro\b\s+dev\b/i,
+  /\bremix\b\s+(dev|vite:dev)\b/i,
+  /\bng\b\s+serve\b/i,
+  /\breact-scripts\b\s+start\b/i,
+  /\bvue-cli-service\b\s+serve\b/i,
+  /\bgatsby\b\s+develop\b/i,
+  /\bstorybook\b/i,
+  /node_modules\/\.bin\/(vite|webpack|next|nuxt|nodemon|tsx|astro|remix|parcel|rollup|serve|nest|ng)/i,
+];
+function isDevProc(cmd) {
+  return DEV_PATTERNS.some(re => re.test(cmd));
+}
+
+// 明确排除的进程：编辑器内置 node、MCP 服务、Claude 等，避免误杀
+const EXCLUDE_PATTERNS = [
+  /ClaudeCode\.app/i,
+  /(^|\/|\s)claude(\s|$)/i,
+  /-mcp\b/i,
+  /mcp[-_]?server/i,
+  /modelcontextprotocol/i,
+  /Visual Studio Code|Code Helper|vscode|node\.mojom/i,
+  /Cursor|cursor/,
+  /language.?server|tsserver|typescript-language-server/i,
+  /copilot/i,
+];
+function isExcludedProc(cmd) {
+  return EXCLUDE_PATTERNS.some(re => re.test(cmd));
+}
+
+// 扫描当前所有残余的 Node 开发进程
+async function findNodeProcs() {
+  let stdout;
+  try {
+    ({ stdout } = await execFileAsync("ps", ["-axww", "-o", "pid=,ppid=,pgid=,rss=,etime=,command="]));
+  } catch {
+    return [];
+  }
+
+  const selfPid = process.pid;
+  const selfPpid = process.ppid;
+  const results = [];
+
+  for (const line of stdout.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/);
+    if (!m) continue;
+    const [, pidS, ppidS, pgidS, rssS, etime, command] = m;
+    const pid = parseInt(pidS, 10);
+    const ppid = parseInt(ppidS, 10);
+    const pgid = parseInt(pgidS, 10);
+    const kb = parseInt(rssS, 10);
+
+    if (pid === selfPid || ppid === selfPid || pid === selfPpid) continue;
+    if (!isNodeProc(command)) continue;
+    if (isExcludedProc(command)) continue;
+    if (!isDevProc(command)) continue;
+    if (filter && !command.toLowerCase().includes(filter)) continue;
+
+    results.push({ pid, ppid, pgid, kb, etime, command, orphaned: ppid === 1 });
+  }
+  return results;
+}
+
 const c = {
   reset:  "\x1b[0m",
   bold:   "\x1b[1m",
@@ -235,17 +320,20 @@ const c = {
 const DOWNLOADS_DIR = `${HOME}/Downloads`;
 
 if (!pathsOnly) {
-  const title = scanDownloads
-    ? "📥 Downloads 大文件扫描器"
-    : scanNpm
-      ? "📦 npm node_modules 扫描器"
-      : "🔍 macOS 卸载残留扫描器";
+  const title = scanProcs
+    ? "🧹 残余 Node 开发进程扫描器"
+    : scanDownloads
+      ? "📥 Downloads 大文件扫描器"
+      : scanNpm
+        ? "📦 npm node_modules 扫描器"
+        : "🔍 macOS 卸载残留扫描器";
   console.log(`\n${c.bold}${title}${c.reset}`);
   if (filter)        console.log(`${c.yellow}过滤关键词：${filter}${c.reset}`);
-  if (showSize)      console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
+  if (showSize && !scanProcs) console.log(`${c.yellow}已开启大小统计（较慢）${c.reset}`);
   if (largeOnly)     console.log(`${c.yellow}只显示 100MB 以上的条目${c.reset}`);
   if (orphansOnly)   console.log(`${c.yellow}只显示对应 app 已卸载的条目${c.reset}`);
   if (scanNpm)       console.log(`${c.yellow}搜索根目录：${HOME}${c.reset}`);
+  if (scanProcs)     console.log(`${c.yellow}匹配：npm run dev / vite / webpack / nodemon 等（已排除 Claude、MCP、编辑器内置 node）${c.reset}`);
   if (scanDownloads) {
     const thresholdKb = largeOnly ? LARGE_THRESHOLD_KB : DOWNLOADS_THRESHOLD_KB;
     console.log(`${c.yellow}搜索目录：${DOWNLOADS_DIR}${c.reset}`);
@@ -257,7 +345,34 @@ if (!pathsOnly) {
 const needSize = showSize || largeOnly;
 let totalCount = 0;
 
-if (scanDownloads) {
+if (scanProcs) {
+  // ── 残余 Node 开发进程扫描模式 ─────────────────
+  const procItems = await findNodeProcs();
+
+  let displayItems = largeOnly
+    ? procItems.filter(p => p.kb >= LARGE_THRESHOLD_KB)
+    : procItems;
+  displayItems = [...displayItems].sort((a, b) => b.kb - a.kb);
+
+  if (!pathsOnly && displayItems.length > 0) {
+    console.log(`${c.cyan}${c.bold}▸ Node 开发进程${c.reset}`);
+  }
+
+  for (const p of displayItems) {
+    if (pathsOnly) {
+      console.log(p.pid);
+    } else {
+      const orphanTag = p.orphaned ? `  ${c.yellow}[孤儿·父进程已退出]${c.reset}` : "";
+      console.log(`  ⚙️  ${c.bold}PID ${p.pid}${c.reset}  ${c.green}${formatKB(p.kb)}${c.reset}  ${c.gray}运行 ${p.etime}${c.reset}${orphanTag}`);
+      console.log(`     ${p.command}`);
+      console.log(`     ${c.gray}PPID ${p.ppid} · 进程组 ${p.pgid}${c.reset}`);
+    }
+    totalCount++;
+  }
+
+  if (!pathsOnly && displayItems.length > 0) console.log();
+
+} else if (scanDownloads) {
   // ── Downloads 大文件扫描模式 ───────────────────
   const thresholdKb = largeOnly ? LARGE_THRESHOLD_KB : DOWNLOADS_THRESHOLD_KB;
   const allFiles = await findLargeFiles(DOWNLOADS_DIR);
@@ -402,12 +517,18 @@ if (scanDownloads) {
 // ──────────────────────────────────────────────
 if (!pathsOnly) {
   if (totalCount === 0) {
-    const msg = scanDownloads
-      ? (filter ? `未找到包含 "${filter}" 的大文件` : "未找到大文件")
-      : scanNpm
-        ? (filter ? `未找到包含 "${filter}" 的 node_modules 目录` : "未找到 node_modules 目录")
-        : (filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留");
+    const msg = scanProcs
+      ? (filter ? `未找到包含 "${filter}" 的残余 Node 开发进程` : "未找到残余 Node 开发进程")
+      : scanDownloads
+        ? (filter ? `未找到包含 "${filter}" 的大文件` : "未找到大文件")
+        : scanNpm
+          ? (filter ? `未找到包含 "${filter}" 的 node_modules 目录` : "未找到 node_modules 目录")
+          : (filter ? `未找到包含 "${filter}" 的残留条目` : "未找到明显残留");
     console.log(`${c.green}✅ ${msg}${c.reset}\n`);
+  } else if (scanProcs) {
+    console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个残余 Node 开发进程${c.reset}`);
+    console.log(`${c.dim}💡 结束示例：bun index.js --procs --paths | xargs kill${c.reset}`);
+    console.log(`${c.dim}⚠️  结束前请确认，避免误杀正在使用的开发服务${c.reset}\n`);
   } else if (scanDownloads) {
     console.log(`${c.bold}共找到 ${c.yellow}${totalCount}${c.reset}${c.bold} 个大文件${c.reset}`);
     console.log(`${c.dim}💡 删除示例：bun index.js --downloads --paths | xargs rm -rf${c.reset}\n`);
