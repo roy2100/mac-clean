@@ -100,3 +100,10 @@ bun index.js --xcode --paths | xargs rm -rf
 ```bash
 bun test
 ```
+
+打包成单文件（仍需目标机器安装 bun，产物写入 `dist/mac-clean.js`，不提交到仓库）：
+
+```bash
+bun run build
+bun dist/mac-clean.js --xcode
+```

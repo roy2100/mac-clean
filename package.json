@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "build": "bun build ./index.js --outfile=dist/mac-clean.js --target=bun"
   }
 }
