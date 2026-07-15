@@ -1,6 +1,6 @@
 # mac-clean
 
-扫描 macOS 上常见的 app 卸载残留文件，也可扫描 `node_modules` 目录、Downloads 大文件和残余的 Node 开发进程。
+扫描 macOS 上常见的 app 卸载残留文件，也可扫描 `node_modules` 目录、Downloads 大文件、残余的 Node 开发进程和 Xcode 缓存。
 
 ## 用法
 
@@ -31,11 +31,24 @@ bun index.js --downloads dmg        # 只展示路径包含 "dmg" 的文件
 bun index.js --procs
 bun index.js --procs --large        # 只展示 RSS ≥100MB 的进程
 bun index.js --procs finance        # 只展示命令行包含 "finance" 的进程
+
+# 扫描 Xcode 缓存目录（附带大小，按大小排序）
+bun index.js --xcode
+bun index.js --xcode derived        # 只展示路径/说明包含 "derived" 的目录
 ```
 
 `--procs` 会列出仍在运行的 Node 开发进程（PID、内存占用、运行时长、完整命令行），
 其中父进程已退出的会标记为 `[孤儿·父进程已退出]`。已自动排除 Claude Code、MCP 服务、
 VS Code / Cursor 内置 node、语言服务器等，避免误杀正在使用的工具。
+
+`--xcode` 会检查以下四个已知的 Xcode 缓存目录是否存在，并显示各自占用的磁盘空间：
+
+| 目录 | 说明 | 是否安全删除 |
+|------|------|------|
+| `~/Library/Developer/Xcode/DerivedData` | 编译索引 / 构建产物 | 安全，下次打开项目会自动重建 |
+| `~/Library/Caches/com.apple.dt.Xcode` | Xcode 运行时缓存 | 安全 |
+| `~/Library/Developer/Xcode/iOS DeviceSupport` | 各 iOS 版本的真机调试支持文件 | 若不需要在旧版 iOS 真机上调试可删 |
+| `~/Library/Developer/Xcode/Archives` | `Product -> Archive` 打包历史（`.xcarchive`） | 删除后会丢失历史版本的符号文件 |
 
 ## 删除示例
 
@@ -52,6 +65,9 @@ bun index.js --downloads --paths | xargs rm -rf
 
 # 结束所有残余 Node 开发进程（--paths 输出 PID）
 bun index.js --procs --paths | xargs kill
+
+# 删除所有存在的 Xcode 缓存目录
+bun index.js --xcode --paths | xargs rm -rf
 ```
 
 ## 扫描范围
@@ -75,3 +91,12 @@ bun index.js --procs --paths | xargs kill
 - 删除前请确认条目确实属于已卸载的 app
 - `~/Library/Group Containers` 中的条目可能被多个 app 共享，删除前需额外确认
 - 脚本不会主动删除任何文件，删除操作由用户自行执行
+
+## 开发
+
+核心扫描逻辑拆分在 `lib/` 目录下（`format` / `residue` / `npm` / `files` / `procs` / `xcode`），
+`index.js` 只负责参数解析、调度和输出。运行单元测试：
+
+```bash
+bun test
+```
